@@ -1,16 +1,18 @@
 //! SCIP generator
 
-use std::{path::PathBuf, time::Instant};
+use std::{iter, path::PathBuf, time::Instant};
 
+use hir::{CfgAtom, CfgExpr, HasAttrs, Semantics, sym};
 use ide::{
     AnalysisHost, LineCol, Moniker, MonikerDescriptorKind, MonikerIdentifier, MonikerResult,
     RootDatabase, StaticIndex, StaticIndexedFile, SymbolInformationKind, TextRange, TokenId,
     TokenStaticData, VendoredLibrariesConfig,
 };
-use ide_db::line_index;
+use ide_db::{base_db::TargetKind, line_index};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use rustc_hash::{FxHashMap, FxHashSet};
 use scip::types::{self as scip_types, SymbolInformation};
+use syntax::{AstNode, SyntaxNode, WalkEvent, ast};
 use tracing::error;
 use vfs::FileId;
 
@@ -137,6 +139,7 @@ impl flags::Scip {
 
             let Some(relative_path) = get_relative_filepath(&vfs, &root, file_id) else { continue };
             let line_index = get_line_index(db, file_id);
+            let test_code = TestCodeRanges::for_file(db, file_id);
 
             let mut occurrences = Vec::new();
             let mut symbols = Vec::new();
@@ -179,17 +182,7 @@ impl flags::Scip {
                     token_ids_referenced.insert(id);
                 }
 
-                // If the range of the def and the range of the token are the same, this must be the definition.
-                // they also must be in the same file. See https://github.com/rust-lang/rust-analyzer/pull/17988
-                let is_definition = match token.definition {
-                    Some(def) => def.file_id == file_id && def.range == text_range,
-                    _ => false,
-                };
-
-                let mut symbol_roles = Default::default();
-                if is_definition {
-                    symbol_roles |= scip_types::SymbolRole::Definition as i32;
-                }
+                let symbol_roles = symbol_roles(token, file_id, text_range, &test_code);
 
                 let enclosing_range = match token.definition_body {
                     Some(def_body) if def_body.file_id == file_id => {
@@ -332,6 +325,132 @@ fn compute_symbol_info(
         display_name: token.display_name.clone().unwrap_or_default(),
         signature_documentation: signature_documentation.into(),
         enclosing_symbol: enclosing_symbol.unwrap_or_default(),
+    }
+}
+
+/// Computes the `symbol_roles` bitset of the occurrence of `token` at `text_range` in `file_id`.
+fn symbol_roles(
+    token: &TokenStaticData,
+    file_id: FileId,
+    text_range: TextRange,
+    test_code: &TestCodeRanges,
+) -> i32 {
+    let mut symbol_roles = 0;
+
+    // If the range of the def and the range of the token are the same, this must be the definition.
+    // they also must be in the same file. See https://github.com/rust-lang/rust-analyzer/pull/17988
+    let is_definition = match token.definition {
+        Some(def) => def.file_id == file_id && def.range == text_range,
+        _ => false,
+    };
+    if is_definition {
+        symbol_roles |= scip_types::SymbolRole::Definition as i32;
+    }
+
+    if test_code.contains(text_range) {
+        symbol_roles |= scip_types::SymbolRole::Test as i32;
+    }
+
+    symbol_roles
+}
+
+/// The text ranges of a file that are only compiled when building tests.
+///
+/// Three rules define test code:
+/// 1. All the code of a `test` or `bench` target, such as `tests/foo.rs`.
+/// 2. Everything inside a node whose `#[cfg]` requires `test`, such as `#[cfg(test)] mod tests`.
+///    The file of a module declared with `mod tests;` is inside that declaration.
+/// 3. `#[test]` and `#[bench]` functions, including those that an attribute macro such as
+///    `#[tokio::test]` produces.
+///
+/// The whole file is test code when every module it defines is a test module by rule 1 or 2
+/// (see [`is_test_module`]). A file defines several modules when several crates include it.
+/// Otherwise, rules 2 and 3 select nodes inside the file (see [`is_test_node`]).
+struct TestCodeRanges(Vec<TextRange>);
+
+impl TestCodeRanges {
+    fn for_file(db: &RootDatabase, file_id: FileId) -> TestCodeRanges {
+        hir::attach_db(db, || {
+            let sema = Semantics::new(db);
+            let root = sema.parse_guess_edition(file_id).syntax().clone();
+
+            // The files of a `StaticIndex` always define at least one module.
+            if sema.file_to_module_defs(file_id).all(|module| is_test_module(db, module)) {
+                return TestCodeRanges(vec![root.text_range()]);
+            }
+
+            let mut ranges = Vec::new();
+            let mut preorder = root.preorder();
+            while let Some(event) = preorder.next() {
+                if let WalkEvent::Enter(node) = event
+                    && is_test_node(&sema, &node)
+                {
+                    ranges.push(node.text_range());
+                    preorder.skip_subtree();
+                }
+            }
+            TestCodeRanges(ranges)
+        })
+    }
+
+    fn contains(&self, range: TextRange) -> bool {
+        self.0.iter().any(|test_range| test_range.contains_range(range))
+    }
+}
+
+/// Is `module` only compiled when building tests? This is the case when its crate is a `test` or
+/// `bench` target (rule 1), or when the module or one of its ancestors has a `#[cfg]` that
+/// requires `test` (rule 2). The `#[cfg]` of a module can be on its declaration, in the parent
+/// module, or an inner attribute in the module itself.
+fn is_test_module(db: &RootDatabase, module: hir::Module) -> bool {
+    let is_test_target =
+        matches!(module.krate(db).target_kind(db), TargetKind::Test | TargetKind::Bench);
+    is_test_target
+        || iter::successors(Some(module), |it| it.parent(db))
+            .any(|it| it.attrs(db).cfgs(db).is_some_and(cfg_requires_test))
+}
+
+/// Does `node` have a `#[cfg]` that requires `test` (rule 2), or is it a test function (rule 3)?
+fn is_test_node(sema: &Semantics<'_, RootDatabase>, node: &SyntaxNode) -> bool {
+    has_test_cfg(node) || ast::Fn::cast(node.clone()).is_some_and(|it| is_test_function(sema, &it))
+}
+
+/// Does `node` have a `#[cfg]` attribute, outer or inner, that requires `test`?
+fn has_test_cfg(node: &SyntaxNode) -> bool {
+    let Some(node) = ast::AnyHasAttrs::cast(node.clone()) else { return false };
+    ast::attrs_including_inner(&node).any(|attr| match attr.meta() {
+        Some(ast::Meta::CfgMeta(cfg)) => cfg
+            .cfg_predicate()
+            .is_some_and(|predicate| cfg_requires_test(&CfgExpr::parse_from_ast(predicate))),
+        _ => false,
+    })
+}
+
+/// Is `function` a `#[test]` or `#[bench]` function?
+///
+/// An attribute macro replaces the function with its expansion, so in that case this checks the
+/// functions of the expansion instead. For example, `#[tokio::test]` expands to a `#[test]`
+/// function.
+fn is_test_function(sema: &Semantics<'_, RootDatabase>, function: &ast::Fn) -> bool {
+    match sema.expand_attr_macro(&ast::Item::Fn(function.clone())) {
+        Some(expansion) => expansion
+            .value
+            .value
+            .children()
+            .filter_map(ast::Fn::cast)
+            .any(|it| is_test_function(sema, &it)),
+        None => sema.to_def(function).is_some_and(|it| it.is_test(sema.db) || it.is_bench(sema.db)),
+    }
+}
+
+/// Can `cfg` only be true when the `test` flag is set? For example, this holds for `test` and
+/// `all(test, unix)`, but not for `any(test, feature = "testing")` or `not(test)`.
+fn cfg_requires_test(cfg: &CfgExpr) -> bool {
+    match cfg {
+        CfgExpr::Atom(CfgAtom::Flag(flag)) => *flag == sym::test,
+        CfgExpr::All(cfgs) => cfgs.iter().any(cfg_requires_test),
+        CfgExpr::Any(cfgs) => cfgs.iter().all(cfg_requires_test),
+        CfgExpr::Atom(CfgAtom::KeyValue { .. }) | CfgExpr::Not(_) | CfgExpr::Invalid => false,
     }
 }
 
@@ -514,8 +633,11 @@ fn moniker_descriptors(identifier: &MonikerIdentifier) -> Vec<scip_types::Descri
 #[cfg(test)]
 mod test {
     use super::*;
+    use expect_test::{Expect, expect};
     use hir::FileRangeWrapper;
     use ide::{FilePosition, TextSize};
+    use ide_db::base_db::SourceDatabase;
+    use std::fmt::Write;
     use test_fixture::ChangeFixture;
     use vfs::VfsPath;
 
@@ -583,6 +705,303 @@ mod test {
 
         assert!(found_symbol.is_some(), "must have one symbol {found_symbol:?}");
         assert_eq!(found_symbol.unwrap(), expected);
+    }
+
+    /// Lists the occurrences emitted for the fixture, one per line, as
+    /// `<path> <line>:<column> <name> [<roles>]`.
+    #[track_caller]
+    fn check_symbol_roles(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+        let mut host = AnalysisHost::default();
+        let change_fixture = ChangeFixture::parse(ra_fixture);
+        host.raw_database_mut().enable_proc_attr_macros();
+        host.raw_database_mut().apply_change(change_fixture.change);
+
+        let analysis = host.analysis();
+        let db = host.raw_database();
+        let si = StaticIndex::compute(
+            &analysis,
+            VendoredLibrariesConfig::Included {
+                workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
+            },
+            false,
+        );
+
+        let mut files: Vec<_> = si
+            .files
+            .iter()
+            .map(|file| {
+                let source_root_id = db.file_source_root(file.file_id).source_root_id(db);
+                let source_root = db.source_root(source_root_id).source_root(db);
+                (source_root.path_for_file(&file.file_id).unwrap().to_string(), file)
+            })
+            .collect();
+        files.sort_by(|(path_a, _), (path_b, _)| path_a.cmp(path_b));
+
+        let mut actual = String::new();
+        for (path, file) in files {
+            let line_index = line_index(db, file.file_id);
+            let test_code = TestCodeRanges::for_file(db, file.file_id);
+            for &(range, id) in &file.tokens {
+                let token = si.tokens.get(id).unwrap();
+                if token.moniker.is_none() {
+                    // No occurrence is emitted for tokens without a moniker.
+                    continue;
+                }
+                let LineCol { line, col } = line_index.line_col(range.start());
+                let name = token.display_name.as_deref().unwrap_or("<crate root>");
+                let roles =
+                    format_symbol_roles(symbol_roles(token, file.file_id, range, &test_code));
+                writeln!(actual, "{path} {line}:{col} {name} [{roles}]").unwrap();
+            }
+        }
+        expect.assert_eq(&actual);
+    }
+
+    /// Formats the roles that SCIP generation sets, e.g. `Definition, Test`.
+    fn format_symbol_roles(symbol_roles: i32) -> String {
+        [scip_types::SymbolRole::Definition, scip_types::SymbolRole::Test]
+            .into_iter()
+            .filter(|role| symbol_roles & *role as i32 != 0)
+            .map(|role| format!("{role:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn test_role_for_unit_tests() {
+        check_symbol_roles(
+            r#"
+//- /workspace/lib.rs crate:main cfg:test
+pub fn add() {}
+
+fn not_test() {
+    add();
+}
+
+#[test]
+fn test_outside_test_module() {
+    add();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    fn helper() {
+        add();
+    }
+
+    #[test]
+    fn it_works() {
+        helper();
+    }
+}
+"#,
+            expect![[r#"
+                /workspace/lib.rs 0:0 <crate root> [Definition]
+                /workspace/lib.rs 0:7 add [Definition]
+                /workspace/lib.rs 2:3 not_test [Definition]
+                /workspace/lib.rs 3:4 add []
+                /workspace/lib.rs 7:3 test_outside_test_module [Definition, Test]
+                /workspace/lib.rs 8:4 add [Test]
+                /workspace/lib.rs 12:4 tests [Definition, Test]
+                /workspace/lib.rs 13:8 <crate root> [Test]
+                /workspace/lib.rs 13:15 add [Test]
+                /workspace/lib.rs 15:7 helper [Definition, Test]
+                /workspace/lib.rs 16:8 add [Test]
+                /workspace/lib.rs 20:7 it_works [Definition, Test]
+                /workspace/lib.rs 21:8 helper [Test]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_role_for_test_targets_and_test_module_files() {
+        check_symbol_roles(
+            r#"
+//- /workspace/src/lib.rs crate:main cfg:test
+pub fn add() {}
+
+mod shared;
+
+#[cfg(test)]
+mod tests;
+
+mod inner_cfg_file;
+//- /workspace/src/shared.rs
+pub fn shared_helper() {
+    crate::add();
+}
+//- /workspace/src/tests.rs
+use super::add;
+
+mod nested;
+
+fn helper() {
+    add();
+}
+//- /workspace/src/tests/nested.rs
+fn nested_helper() {
+    super::helper();
+}
+//- /workspace/src/inner_cfg_file.rs
+#![cfg(test)]
+
+fn helper() {}
+//- /workspace/tests/integration.rs crate:test:integration deps:main cfg:test
+use main::add;
+
+#[path = "../src/shared.rs"]
+mod shared;
+
+fn helper() {
+    add();
+}
+//- /workspace/benches/bench.rs crate:bench:bench deps:main cfg:test
+fn run() {
+    main::add();
+}
+//- /workspace/src/bin/tool.rs crate:bin:tool deps:main cfg:test
+fn not_test() {
+    main::add();
+}
+"#,
+            expect![[r#"
+                /workspace/benches/bench.rs 0:0 <crate root> [Definition, Test]
+                /workspace/benches/bench.rs 0:3 run [Definition, Test]
+                /workspace/benches/bench.rs 1:4 <crate root> [Test]
+                /workspace/benches/bench.rs 1:10 add [Test]
+                /workspace/src/bin/tool.rs 0:0 <crate root> [Definition]
+                /workspace/src/bin/tool.rs 0:3 not_test [Definition]
+                /workspace/src/bin/tool.rs 1:4 <crate root> []
+                /workspace/src/bin/tool.rs 1:10 add []
+                /workspace/src/inner_cfg_file.rs 0:0 inner_cfg_file [Definition, Test]
+                /workspace/src/inner_cfg_file.rs 2:3 helper [Definition, Test]
+                /workspace/src/lib.rs 0:0 <crate root> [Definition]
+                /workspace/src/lib.rs 0:7 add [Definition]
+                /workspace/src/lib.rs 2:4 shared []
+                /workspace/src/lib.rs 5:4 tests [Test]
+                /workspace/src/lib.rs 7:4 inner_cfg_file []
+                /workspace/src/shared.rs 0:0 shared [Definition]
+                /workspace/src/shared.rs 0:7 shared_helper [Definition]
+                /workspace/src/shared.rs 1:4 <crate root> []
+                /workspace/src/shared.rs 1:11 add []
+                /workspace/src/tests.rs 0:0 tests [Definition, Test]
+                /workspace/src/tests.rs 0:4 <crate root> [Test]
+                /workspace/src/tests.rs 0:11 add [Test]
+                /workspace/src/tests.rs 2:4 nested [Test]
+                /workspace/src/tests.rs 4:3 helper [Definition, Test]
+                /workspace/src/tests.rs 5:4 add [Test]
+                /workspace/src/tests/nested.rs 0:0 nested [Definition, Test]
+                /workspace/src/tests/nested.rs 0:3 nested_helper [Definition, Test]
+                /workspace/src/tests/nested.rs 1:4 tests [Test]
+                /workspace/src/tests/nested.rs 1:11 helper [Test]
+                /workspace/tests/integration.rs 0:0 <crate root> [Definition, Test]
+                /workspace/tests/integration.rs 0:4 <crate root> [Test]
+                /workspace/tests/integration.rs 0:10 add [Test]
+                /workspace/tests/integration.rs 3:4 shared [Test]
+                /workspace/tests/integration.rs 5:3 helper [Definition, Test]
+                /workspace/tests/integration.rs 6:4 add [Test]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_role_for_attribute_macros() {
+        check_symbol_roles(
+            r#"
+//- proc_macros: identity, input_replace
+//- /workspace/lib.rs crate:main cfg:test
+pub fn add() {}
+
+#[proc_macros::input_replace(#[test] fn expanded_test() { add(); })]
+fn replaced() {}
+
+#[proc_macros::identity]
+#[test]
+fn test_under_identity() {
+    add();
+}
+
+#[proc_macros::identity]
+#[proc_macros::input_replace(#[test] fn stacked_test() { add(); })]
+fn stacked() {}
+
+#[proc_macros::identity]
+fn not_test() {
+    add();
+}
+"#,
+            expect![[r#"
+                /workspace/lib.rs 0:0 <crate root> [Definition]
+                /workspace/lib.rs 0:7 add [Definition]
+                /workspace/lib.rs 2:2 <crate root> [Test]
+                /workspace/lib.rs 2:15 input_replace [Test]
+                /workspace/lib.rs 2:40 expanded_test [Definition, Test]
+                /workspace/lib.rs 2:58 add [Test]
+                /workspace/lib.rs 5:2 <crate root> [Test]
+                /workspace/lib.rs 5:15 identity [Test]
+                /workspace/lib.rs 7:3 test_under_identity [Definition, Test]
+                /workspace/lib.rs 8:4 add [Test]
+                /workspace/lib.rs 11:2 <crate root> [Test]
+                /workspace/lib.rs 11:15 identity [Test]
+                /workspace/lib.rs 12:2 <crate root> [Test]
+                /workspace/lib.rs 12:15 input_replace [Test]
+                /workspace/lib.rs 12:40 stacked_test [Definition, Test]
+                /workspace/lib.rs 12:57 add [Test]
+                /workspace/lib.rs 15:2 <crate root> []
+                /workspace/lib.rs 15:15 identity []
+                /workspace/lib.rs 16:3 not_test [Definition]
+                /workspace/lib.rs 17:4 add []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_role_for_cfg_combinations() {
+        check_symbol_roles(
+            r#"
+//- /workspace/lib.rs crate:main cfg:test,unix
+pub struct S;
+
+#[cfg(all(test, unix))]
+impl S {
+    fn only_in_tests() {}
+}
+
+#[cfg(any(test, unix))]
+pub fn not_only_in_tests() {}
+
+pub fn not_test() {
+    #[cfg(test)]
+    let test_only = S;
+    let always = S;
+}
+
+mod inner_cfg {
+    #![cfg(test)]
+    fn helper() {}
+}
+
+#[bench]
+fn bench() {}
+"#,
+            expect![[r#"
+                /workspace/lib.rs 0:0 <crate root> [Definition]
+                /workspace/lib.rs 0:11 S [Definition]
+                /workspace/lib.rs 3:5 S [Test]
+                /workspace/lib.rs 4:7 only_in_tests [Definition, Test]
+                /workspace/lib.rs 8:7 not_only_in_tests [Definition]
+                /workspace/lib.rs 10:7 not_test [Definition]
+                /workspace/lib.rs 12:8 test_only [Definition, Test]
+                /workspace/lib.rs 12:20 S [Test]
+                /workspace/lib.rs 13:8 always [Definition]
+                /workspace/lib.rs 13:17 S []
+                /workspace/lib.rs 16:4 inner_cfg [Definition, Test]
+                /workspace/lib.rs 18:7 helper [Definition, Test]
+                /workspace/lib.rs 22:3 bench [Definition, Test]
+            "#]],
+        );
     }
 
     #[test]
